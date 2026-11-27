@@ -400,6 +400,438 @@ function screen(rgba, width, height) {
   return best;
 }
 
+// zopt.mjs — optimal-parsing deflate (zopfli-lite), standalone test version.
+// Given filtered bytes, returns a zlib stream that is (usually) smaller than zlib level 9's,
+// or null when it is not. Deterministic: fixed work limits, no clock, no randomness.
+// Method: hash-chain LZ77 matching (bounded chain), shortest-path DP over literal/match
+// choices with Huffman bit costs, 2 cost-model iterations, dynamic Huffman blocks
+// (length-limited to 15 bits, zlib gen_bitlen overflow rule), fixed 128 KiB blocks.
+
+// ---- DEFLATE tables ----
+const LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+const DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+// Lengths at which the length code changes (plus 258): the only match lengths the DP tries.
+const LEN_STEPS = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const isStep = new Uint8Array(259);
+for (const l of LEN_STEPS) isStep[l] = 1;
+
+const lenSymOf = new Uint16Array(259); // NB: symbols 257..285 do NOT fit in a byte
+const lenExtraOf = new Uint8Array(259);
+for (let s = 0; s < 29; s++) {
+  const base = LEN_BASE[s];
+  const next = s === 28 ? 259 : LEN_BASE[s + 1];
+  for (let l = base; l < next; l++) { lenSymOf[l] = 257 + s; lenExtraOf[l] = LEN_EXTRA[s]; }
+}
+const distSymOf = new Uint8Array(32769);
+const distExtraOf = new Uint8Array(32769);
+for (let s = 0; s < 30; s++) {
+  const base = DIST_BASE[s];
+  const next = s === 29 ? 32769 : DIST_BASE[s + 1];
+  for (let d = base; d < next; d++) { distSymOf[d] = s; distExtraOf[d] = DIST_EXTRA[s]; }
+}
+const FIXED_LIT_LEN = new Uint8Array(288);
+for (let i = 0; i < 288; i++) FIXED_LIT_LEN[i] = i < 144 ? 8 : i < 256 ? 9 : i < 280 ? 7 : 8;
+const FIXED_DIST_LEN = new Uint8Array(32).fill(5);
+
+// ---- adler32 ----
+function adler32(data) {
+  let a = 1, b = 0;
+  for (let i = 0; i < data.length;) {
+    const end = Math.min(data.length, i + 5552);
+    for (; i < end; i++) { a += data[i]; b += a; }
+    a %= 65521; b %= 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+// ---- length-limited Huffman code lengths (zlib gen_bitlen method) ----
+function codeLengths(freqs, maxBits) {
+  const n = freqs.length;
+  const lengths = new Uint8Array(n);
+  // Heap of (freq, symbol) for the plain Huffman tree.
+  const heap = [];
+  const push = (f, s) => { heap.push([f, s]); let i = heap.length - 1; while (i > 0) { const p = (i - 1) >> 1; if (heap[p][0] <= heap[i][0]) break; [heap[p], heap[i]] = [heap[i], heap[p]]; i = p; } };
+  const pop = () => {
+    const top = heap[0];
+    const last = heap.pop();
+    if (heap.length > 0) {
+      heap[0] = last;
+      let i = 0;
+      for (;;) {
+        const l = i * 2 + 1, r = l + 1;
+        let m = i;
+        if (l < heap.length && heap[l][0] < heap[m][0]) m = l;
+        if (r < heap.length && heap[r][0] < heap[m][0]) m = r;
+        if (m === i) break;
+        [heap[m], heap[i]] = [heap[i], heap[m]]; i = m;
+      }
+    }
+    return top;
+  };
+  let used = 0;
+  for (let s = 0; s < n; s++) if (freqs[s] > 0) { push(freqs[s], s); used++; }
+  if (used === 0) return lengths;
+  if (used === 1) { lengths[heap[0][1]] = 1; return lengths; }
+  // Tree nodes: leaves are symbols, internal nodes get fresh ids >= n.
+  const parent = new Int32Array(2 * n).fill(-1);
+  const depth = new Uint8Array(2 * n);
+  let next = n;
+  const freq = new Float64Array(2 * n);
+  for (let s = 0; s < n; s++) freq[s] = freqs[s];
+  while (heap.length > 1) {
+    const [f1, s1] = pop();
+    const [f2, s2] = pop();
+    freq[next] = f1 + f2;
+    parent[s1] = next; parent[s2] = next;
+    push(f1 + f2, next);
+    next++;
+  }
+  const root = heap.length === 1 ? heap[0][1] : next - 1;
+  // Depths by walking parents (tree is a chain of single-child? no: binary, use stack).
+  const stack = [[root, 0]];
+  const blCount = new Int32Array(maxBits + 2);
+  let overflow = 0;
+  while (stack.length > 0) {
+    const [node, d] = stack.pop();
+    if (node < n) {
+      if (d > maxBits) { overflow++; lengths[node] = maxBits; }
+      else lengths[node] = d;
+      if (d <= maxBits) blCount[d]++;
+      continue;
+    }
+    // children of an internal node: find them by scanning parent links (n small here: 288/32)
+    for (let s = 0; s < next; s++) if (parent[s] === node) stack.push([s, d + 1]);
+  }
+  if (overflow === 0) return lengths;
+  // zlib's overflow fix: move leaves down until no length exceeds maxBits.
+  const counts = new Int32Array(maxBits + 2);
+  for (let s = 0; s < n; s++) if (lengths[s] > 0) counts[Math.min(lengths[s], maxBits)]++;
+  // Recompute blCount from clamped lengths, then apply the loop on counts.
+  let over = 0;
+  for (let s = 0; s < n; s++) if (lengths[s] === maxBits && freq[s] > 0) over++;
+  // Simpler correct approach: recount overflow as the number of symbols that were over.
+  // (We clamped them to maxBits above; the counts array now holds them at maxBits.)
+  // zlib's loop, on counts:
+  let ov = overflow;
+  const bc = new Int32Array(maxBits + 2);
+  for (let s = 0; s < n; s++) if (lengths[s] > 0) bc[lengths[s]]++;
+  while (ov > 0) {
+    let bits = maxBits - 1;
+    while (bc[bits] === 0) bits--;
+    bc[bits]--;
+    bc[bits + 1] += 2;
+    bc[maxBits]--;
+    ov -= 2;
+  }
+  // Reassign lengths by frequency order using bc.
+  const order = [];
+  for (let s = 0; s < n; s++) if (freqs[s] > 0) order.push(s);
+  order.sort((a, b) => freqs[b] - freqs[a] || a - b);
+  lengths.fill(0);
+  let at = 0;
+  for (let l = 1; l <= maxBits; l++) {
+    for (let k = 0; k < bc[l]; k++) {
+      if (at < order.length) lengths[order[at++]] = l;
+    }
+  }
+  return lengths;
+}
+
+// Canonical Huffman codes from lengths: {codes: Uint16Array, lengths}.
+function canonicalCodes(lengths) {
+  const n = lengths.length;
+  const maxLen = Math.max(0, ...lengths);
+  const blCount = new Int32Array(maxLen + 1);
+  for (let s = 0; s < n; s++) if (lengths[s] > 0) blCount[lengths[s]]++;
+  const nextCode = new Int32Array(maxLen + 1);
+  let code = 0;
+  for (let l = 1; l <= maxLen; l++) { code = (code + blCount[l - 1]) << 1; nextCode[l] = code; }
+  const codes = new Uint16Array(n);
+  for (let s = 0; s < n; s++) {
+    const l = lengths[s];
+    if (l > 0) codes[s] = nextCode[l]++;
+  }
+  return { codes, lengths };
+}
+
+// ---- bit writer (LSB-first) ----
+class BitWriter {
+  constructor() { this.bytes = []; this.acc = 0; this.nbits = 0; }
+  write(value, len) {
+    this.acc |= (value & ((1 << len) - 1)) << this.nbits;
+    this.nbits += len;
+    while (this.nbits >= 8) {
+      this.bytes.push(this.acc & 0xff);
+      this.acc >>>= 8;
+      this.nbits -= 8;
+    }
+  }
+  writeCode(code, len) { this.write(code, len); }
+  // Write a Huffman code with its bits reversed (DEFLATE packs codes MSB-first within the code).
+  writeHuff(code, len) {
+    let rev = 0;
+    for (let i = 0; i < len; i++) { rev = (rev << 1) | ((code >> i) & 1); }
+    this.write(rev, len);
+  }
+  finish() {
+    if (this.nbits > 0) this.bytes.push(this.acc & 0xff);
+    return Uint8Array.from(this.bytes);
+  }
+}
+
+// ---- LZ77 matching (hash chains, bounded) ----
+let MAX_CHAIN = 32;
+const HASH_BITS = 15;
+const HASH_SIZE = 1 << HASH_BITS;
+const HASH_MASK = HASH_SIZE - 1;
+
+function findMatches(data) {
+  const n = data.length;
+  const len = new Uint16Array(n);
+  const dist = new Uint16Array(n);
+  const head = new Int32Array(HASH_SIZE).fill(-1);
+  const prev = new Int32Array(n).fill(-1);
+  for (let i = 0; i < n; i++) {
+    if (i + 3 > n) { head[0] = i; continue; }
+    const h = ((data[i] << 10) ^ (data[i + 1] << 5) ^ data[i + 2]) & HASH_MASK;
+    let p = head[h];
+    let bestLen = 0;
+    let bestDist = 0;
+    let tried = 0;
+    while (p >= 0 && tried < MAX_CHAIN) {
+      const d = i - p;
+      if (d > 32768) break;
+      tried++;
+      // Prune: this candidate can only beat bestLen if the byte just past it matches too.
+      if (data[p + bestLen] !== data[i + bestLen]) { p = prev[p]; continue; }
+      // Longest match between data[p..] and data[i..], capped at 258 and at the input end.
+      const maxLen = Math.min(258, n - i);
+      let l = 0;
+      while (l < maxLen && data[p + l] === data[i + l]) l++;
+      if (l > bestLen && l >= 3) { bestLen = l; bestDist = d; if (l === 258) break; if (l >= 32 && d <= 1024) break; }
+      p = prev[p];
+    }
+    if (bestLen >= 3) { len[i] = bestLen; dist[i] = bestDist; }
+    prev[i] = head[h];
+    head[h] = i;
+  }
+  return { len, dist };
+}
+
+// Fixed-Huffman block body (BTYPE=01) for the same symbols; the caller picks the shorter
+// of the dynamic and fixed encodings per block.
+function emitFixedBlockBody(w, symbols) {
+  const litCode = canonicalCodes(FIXED_LIT_LEN);
+  const distCode = canonicalCodes(FIXED_DIST_LEN);
+  w.write(0b01, 2); // BTYPE fixed (BFINAL already written by caller)
+  for (const s of symbols) {
+    if (s.lit !== undefined) w.writeHuff(litCode.codes[s.lit], FIXED_LIT_LEN[s.lit]);
+    else {
+      const ls = lenSymOf[s.len];
+      w.writeHuff(litCode.codes[ls], FIXED_LIT_LEN[ls]);
+      const le = lenExtraOf[s.len];
+      if (le > 0) w.write(s.len - LEN_BASE[ls - 257], le);
+      const ds = distSymOf[s.dist];
+      w.writeHuff(distCode.codes[ds], FIXED_DIST_LEN[ds]);
+      const de = distExtraOf[s.dist];
+      if (de > 0) w.write(s.dist - DIST_BASE[ds], de);
+    }
+  }
+  w.writeHuff(litCode.codes[256], FIXED_LIT_LEN[256]);
+}
+
+// ---- shortest-path DP over one block ----
+function shortestPath(data, b0, b1, matches, litCost, distCost) {
+  const n = b1 - b0;
+  const cost = new Float64Array(n + 1).fill(Infinity);
+  const choice = new Int16Array(n + 1); // 0 = literal, else match length
+  const choiceDist = new Uint16Array(n + 1);
+  cost[0] = 0;
+  // Precomputed match-length cost (length symbol bits + extra bits) by length.
+  const lenCost = new Float64Array(259);
+  for (let l = 3; l <= 258; l++) lenCost[l] = litCost[lenSymOf[l]] + lenExtraOf[l];
+  for (let i = 0; i < n; i++) {
+    const c = cost[i];
+    if (c === Infinity) continue;
+    const lit = c + litCost[data[b0 + i]];
+    if (lit < cost[i + 1]) { cost[i + 1] = lit; choice[i + 1] = 0; }
+    const ml = matches.len[b0 + i];
+    if (ml >= 3) {
+      const d = matches.dist[b0 + i];
+      const dc = distCost[distSymOf[d]] + distExtraOf[d];
+      const maxL = Math.min(ml, n - i);
+      const minL = maxL >= 6 ? (maxL >> 1) : 3;
+      for (let si = 0; si < LEN_STEPS.length; si++) {
+        const l = LEN_STEPS[si];
+        if (l > maxL) break;
+        if (l < minL) continue;
+        const nc = c + lenCost[l] + dc;
+        if (nc < cost[i + l]) { cost[i + l] = nc; choice[i + l] = l; choiceDist[i + l] = d; }
+      }
+      if (maxL > 3 && !isStep[maxL]) {
+        const nc = c + lenCost[maxL] + dc;
+        if (nc < cost[i + maxL]) { cost[i + maxL] = nc; choice[i + maxL] = maxL; choiceDist[i + maxL] = d; }
+      }
+    }
+  }
+  // Backtrack.
+  const symbols = [];
+  let i = n;
+  while (i > 0) {
+    const ch = choice[i];
+    if (ch === 0) { symbols.push({ lit: data[b0 + i - 1] }); i--; }
+    else { symbols.push({ len: ch, dist: choiceDist[i] }); i -= ch; }
+  }
+  symbols.reverse();
+  return { symbols, cost: cost[n] };
+}
+
+function costsFromLengths(lengths) {
+  const c = new Float64Array(lengths.length);
+  for (let s = 0; s < lengths.length; s++) c[s] = lengths[s] === 0 ? 1e9 : lengths[s];
+  return c;
+}
+
+// ---- top level: optimal deflate of `data` (Uint8Array) -> zlib stream (Buffer) or null ----
+let BLOCK = 131072;
+let ITERATIONS = 3;
+
+function optimalDeflate(data) {
+  const matches = findMatches(data);
+  const w = new BitWriter();
+  // We must write BFINAL per block: handle it by writing the block header bit here.
+  // Instead of fighting the writer, emit each block into its own writer and stitch:
+  // simpler: build the whole stream with a custom approach — write BFINAL+BTYPE as the
+  // first 3 bits of each block via the writer, tracking block index.
+  const litCost = costsFromLengths(FIXED_LIT_LEN);
+  const distCost = costsFromLengths(FIXED_DIST_LEN);
+  for (let b0 = 0; b0 < data.length; b0 += BLOCK) {
+    const b1 = Math.min(data.length, b0 + BLOCK);
+    const last = b1 === data.length;
+    // Iteration 1: fixed costs. Iteration 2: costs from the path's Huffman lengths.
+    let best = null;
+    let lc = litCost;
+    let dc = distCost;
+    for (let iter = 0; iter < ITERATIONS; iter++) {
+      const { symbols, cost } = shortestPath(data, b0, b1, matches, lc, dc);
+      best = { symbols, cost }; // last iteration wins (costs are per-model; not comparable)
+      if (iter < ITERATIONS - 1) {
+        const litFreq = new Float64Array(288);
+        const distFreq = new Float64Array(32);
+        for (const s of symbols) {
+          if (s.lit !== undefined) litFreq[s.lit]++;
+          else { litFreq[lenSymOf[s.len]]++; distFreq[distSymOf[s.dist]]++; }
+        }
+        litFreq[256]++;
+        lc = costsFromLengths(codeLengths(litFreq, 15));
+        dc = costsFromLengths(codeLengths(distFreq, 15));
+      }
+    }
+    // Emit the block: BFINAL + BTYPE=10, then the dynamic block body.
+    // emitDynamicBlock writes BTYPE itself with BFINAL=0; patch: write BFINAL first.
+    // We re-implement the first bits here by writing BFINAL then calling a variant.
+    // Simplest: write the 1 BFINAL bit, then the 2 BTYPE bits, then the body without header.
+    w.write(last ? 1 : 0, 1);
+    emitDynamicBlockBody(w, best.symbols);
+  }
+  const raw = w.finish();
+  const out = new Uint8Array(raw.length + 6);
+  out[0] = 0x78; out[1] = 0xda;
+  out.set(raw, 2);
+  new DataView(out.buffer).setUint32(2 + raw.length, adler32(data));
+  // Verify: inflate back.
+  try {
+    const back = inflateSync(out, { maxOutputLength: data.length + 1 });
+    if (back.length !== data.length || Buffer.compare(back, data) !== 0) return null;
+  } catch { return null; }
+  return Buffer.from(out);
+}
+
+// emitDynamicBlockBody: the dynamic block without the leading BFINAL/BTYPE bits.
+function emitDynamicBlockBody(w, symbols) {
+  const litFreq = new Float64Array(288);
+  const distFreq = new Float64Array(32);
+  for (const s of symbols) {
+    if (s.lit !== undefined) litFreq[s.lit]++;
+    else { litFreq[lenSymOf[s.len]]++; distFreq[distSymOf[s.dist]]++; }
+  }
+  litFreq[256]++;
+  const litLen = codeLengths(litFreq, 15);
+  const distLen = codeLengths(distFreq, 15);
+  let litUsed = 0;
+  for (let s = 0; s < 288; s++) if (litLen[s] > 0) litUsed++;
+  if (litUsed < 2) {
+    litLen[256] = 1;
+    for (let s = 0; s < 288; s++) if (s !== 256 && litFreq[s] > 0) { litLen[s] = 1; break; }
+    if (litUsed < 2) litLen[0] = 1;
+  }
+  let distUsed = 0;
+  for (let s = 0; s < 32; s++) if (distLen[s] > 0) distUsed++;
+  if (distUsed === 0) distLen[0] = 1;
+  const litCode = canonicalCodes(litLen);
+  const distCode = canonicalCodes(distLen);
+  let hlit = 288;
+  while (hlit > 257 && litLen[hlit - 1] === 0) hlit--;
+  let hdist = 32;
+  while (hdist > 1 && distLen[hdist - 1] === 0) hdist--;
+  const seq = [];
+  for (let s = 0; s < hlit; s++) seq.push(litLen[s]);
+  for (let s = 0; s < hdist; s++) seq.push(distLen[s]);
+  const rle = [];
+  for (let i = 0; i < seq.length;) {
+    const v = seq[i];
+    let run = 1;
+    while (i + run < seq.length && seq[i + run] === v) run++;
+    if (v === 0) {
+      let left = run;
+      while (left >= 11) { const take = Math.min(left, 138); rle.push({ sym: 18, extra: take - 11, extraBits: 7 }); left -= take; }
+      if (left >= 3) { rle.push({ sym: 17, extra: left - 3, extraBits: 3 }); left = 0; }
+      while (left > 0) { rle.push({ sym: 0, extra: 0, extraBits: 0 }); left--; }
+    } else {
+      rle.push({ sym: v, extra: 0, extraBits: 0 });
+      let left = run - 1;
+      while (left >= 3) { const take = Math.min(left, 6); rle.push({ sym: 16, extra: take - 3, extraBits: 2 }); left -= take; }
+      while (left > 0) { rle.push({ sym: v, extra: 0, extraBits: 0 }); left--; }
+    }
+    i += run;
+  }
+  const clFreq = new Float64Array(19);
+  for (const e of rle) clFreq[e.sym]++;
+  const clLen = codeLengths(clFreq, 7);
+  const clCode = canonicalCodes(clLen);
+  const ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+  let hclen = 19;
+  while (hclen > 4 && clLen[ORDER[hclen - 1]] === 0) hclen--;
+  w.write(0b10, 2); // BTYPE dynamic (BFINAL already written by caller)
+  w.write(hlit - 257, 5);
+  w.write(hdist - 1, 5);
+  w.write(hclen - 4, 4);
+  for (let k = 0; k < hclen; k++) w.write(clLen[ORDER[k]], 3);
+  for (const e of rle) {
+    w.writeHuff(clCode.codes[e.sym], clLen[e.sym]);
+    if (e.extraBits > 0) w.write(e.extra, e.extraBits);
+  }
+  for (const s of symbols) {
+    if (s.lit !== undefined) w.writeHuff(litCode.codes[s.lit], litLen[s.lit]);
+    else {
+      const ls = lenSymOf[s.len];
+      w.writeHuff(litCode.codes[ls], litLen[ls]);
+      const le = lenExtraOf[s.len];
+      if (le > 0) w.write(s.len - LEN_BASE[ls - 257], le);
+      const ds = distSymOf[s.dist];
+      w.writeHuff(distCode.codes[ds], distLen[ds]);
+      const de = distExtraOf[s.dist];
+      if (de > 0) w.write(s.dist - DIST_BASE[ds], de);
+    }
+  }
+  w.writeHuff(litCode.codes[256], litLen[256]);
+}
+
+// DEBUG ONLY: expose internals for testing.
+
+// ---------------------------------------------------------------- optimal deflate
 // Re-compress the winner's filtered data at level 9 under several strategies, plus a
 // 64 KiB-blocked stream (each block its own Huffman table, via Z_BLOCK flushes); keep the
 // smallest. The blocked stream is built with the streaming API; its bytes are verified by
@@ -437,8 +869,13 @@ async function finalDeflate(data) {
     const out = deflateSync(data, opts);
     if (best === null || out.length < best.length) best = out;
   }
-  const blocked = await deflateBlocked(data, 65536);
-  if (blocked.length < best.length) {
+  const bestBeforeOpt = best.length;
+  const opt = optimalDeflate(data);
+  if (opt !== null && opt.length < best.length) best = opt;
+  // The blocked stream only gets a run when the optimal parser did not already win:
+  // it is a weaker deflate, so it can only matter when the optimal path lost.
+  const blocked = (opt !== null && opt.length < bestBeforeOpt) ? null : await deflateBlocked(data, 65536);
+  if (blocked !== null && blocked.length < best.length) {
     // Trust the blocked stream only if it inflates back to exactly the filtered data.
     try {
       const back = inflateSync(blocked, { maxOutputLength: data.length + 1 });
